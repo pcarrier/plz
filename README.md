@@ -15,8 +15,9 @@ plz init fish | source
 Put `plz init fish | source` at the end of `fish_user_key_bindings` (or in
 `config.fish` if you don't customize bindings). Enter, Ctrl-J, and Ctrl-Enter
 then check the entire buffer before executing it, in default and insert modes.
-Denied commands stay in the buffer for editing. Incomplete input still uses
-fish's normal multiline editing.
+Denied commands stay in the buffer for editing, with the confirmation answer
+and denial message preserved above the prompt even for multiline input.
+Incomplete input still uses fish's normal multiline editing.
 
 When a command needs confirmation, type **O + Enter** to allow once, **A + Enter**
 to allow always, or anything else for no. Confirmation reads from `/dev/tty`,
@@ -97,7 +98,9 @@ shell, PATH, OS, user ID, model, endpoint, and review policy. **Always** applies
 to that exact key, not a command prefix or pattern. **Once** and **no** are
 recorded forever but leave the cached confirmation verdict intact, so the next
 execution asks again without another API call. Failed API requests are retried
-on the next invocation rather than cached as decisions.
+on the next invocation rather than cached as decisions. Transient network errors
+(including connection resets and timeouts) are also retried automatically, up to
+four attempts with 100/200/400 ms backoff. Waiting-time stats include these retries.
 
 The daemon detaches from the shell and serializes requests, reusing an HTTP
 connection. State is private to your user (directory mode 0700, database mode
@@ -126,6 +129,8 @@ track changes to those. The default review policy focuses on likely mistakes.
 ```sh
 nix develop
 cargo build
+cargo test
+python tests/fish.py target/debug/plz
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 nix build

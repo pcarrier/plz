@@ -47,13 +47,38 @@
               fish
               sqlite
               nixfmt
+              (python3.withPackages (p: [
+                p.pexpect
+                p.pyte
+              ]))
             ];
           };
         }
       );
 
-      checks = forAllSystems (system: {
-        package = self.packages.${system}.default;
-      });
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          package = self.packages.${system}.default;
+          fish =
+            pkgs.runCommand "plz-fish-check"
+              {
+                nativeBuildInputs = [
+                  pkgs.fish
+                  (pkgs.python3.withPackages (p: [
+                    p.pexpect
+                    p.pyte
+                  ]))
+                ];
+              }
+              ''
+                python ${./tests/fish.py} ${self.packages.${system}.default}/bin/plz
+                touch $out
+              '';
+        }
+      );
     };
 }

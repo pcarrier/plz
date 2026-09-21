@@ -15,6 +15,10 @@ function __plz_execute --description 'Check the entire buffer before executing i
     if commandline --current-buffer | command plz check --shell fish
         commandline -f execute
     else
+        # Like fish's __fish_echo, leave room for repaint to move back up over
+        # the prompt and buffer without erasing the check's output.
+        set -l lines (math (commandline --line) + (count (fish_prompt)) - 2)
+        string repeat -N --count=$lines \n >&2
         commandline -f repaint
     end
 end

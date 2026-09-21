@@ -393,6 +393,66 @@ fn verdict(response: &Value) -> Result<&'static str> {
     }
 }
 
+fn retryable(error: &ureq::Error) -> bool {
+    if matches!(
+        error.kind(),
+        ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed
+    ) {
+        return true;
+    }
+    // ureq and its JSON reader can wrap the underlying I/O error several times.
+    let mut source: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<io::Error>()
+            && matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::Interrupted
+            )
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+fn call_api(agent: &ureq::Agent, endpoint: &str, api_key: &str, body: &Value) -> Result<Value> {
+    let mut retries = 0;
+    loop {
+        let result = agent
+            .post(endpoint)
+            .set("Authorization", &format!("Bearer {api_key}"))
+            .send_json(body.clone())
+            .map_err(Box::new)
+            .and_then(|response| {
+                // ureq's into_json stringifies errors, losing their I/O kind.
+                serde_json::from_reader(response.into_reader()).map_err(|error| {
+                    let kind = error.io_error_kind().unwrap_or(if error.is_eof() {
+                        io::ErrorKind::UnexpectedEof
+                    } else {
+                        io::ErrorKind::InvalidData
+                    });
+                    Box::new(ureq::Error::from(io::Error::new(kind, error)))
+                })
+            });
+        match result {
+            Ok(response) => return Ok(response),
+            Err(error) if retries < 3 && retryable(&error) => {
+                thread::sleep(Duration::from_millis(100 << retries));
+                retries += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn handle(
     db: &mut Connection,
     agent: &ureq::Agent,
@@ -451,10 +511,11 @@ fn handle(
     if request.api_key.is_empty() {
         return Err("run `plz set-key` or set TYPESAFE_API_KEY for uncached commands".into());
     }
-    let response: Value = agent
-        .post(&request.endpoint)
-        .set("Authorization", &format!("Bearer {}", request.api_key))
-        .send_json(json!({
+    let response = call_api(
+        agent,
+        &request.endpoint,
+        &request.api_key,
+        &json!({
             "model": request.model,
             "state": request.context,
             "questions": { "safety": {
@@ -465,8 +526,8 @@ fn handle(
                     "confirm": "Ask the user to confirm before running."
                 }
             }}
-        }))?
-        .into_json()?;
+        }),
+    )?;
     let verdict = verdict(&response)?;
     db.execute(
         "INSERT INTO verdicts (key, verdict, response) VALUES (?1, ?2, ?3)",
@@ -693,6 +754,133 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("plz: {error}; command not run");
             ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    enum Response {
+        Reset,
+        Truncated,
+        Http(&'static str, &'static str),
+    }
+
+    fn server(responses: Vec<Response>) -> (String, thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let worker = thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for response in responses {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("mock server accept: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                drop(reader);
+                bodies.push(body);
+                match response {
+                    Response::Reset => {
+                        let linger = libc::linger {
+                            l_onoff: 1,
+                            l_linger: 0,
+                        };
+                        // SAFETY: stream is open and the option points to a valid linger.
+                        assert_eq!(
+                            unsafe {
+                                libc::setsockopt(
+                                    stream.as_raw_fd(),
+                                    libc::SOL_SOCKET,
+                                    libc::SO_LINGER,
+                                    &linger as *const _ as *const _,
+                                    std::mem::size_of_val(&linger) as libc::socklen_t,
+                                )
+                            },
+                            0
+                        );
+                    }
+                    Response::Truncated => {
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"ok\":").unwrap();
+                    }
+                    Response::Http(status, body) => {
+                        write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    }
+                }
+            }
+            bodies
+        });
+        (url, worker)
+    }
+
+    #[test]
+    fn retries_reset_and_truncated_body() {
+        let (url, worker) = server(vec![
+            Response::Reset,
+            Response::Truncated,
+            Response::Http("200 OK", "{\"ok\":true}"),
+        ]);
+        let body = json!({"state": "pwd"});
+        let result = call_api(&ureq::agent(), &url, "test-key", &body);
+        let requests = worker.join().unwrap();
+        assert_eq!(result.unwrap(), json!({"ok": true}));
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|request| serde_json::from_slice::<Value>(request).unwrap() == body)
+        );
+    }
+
+    #[test]
+    fn limits_retries_and_preserves_error() {
+        let (url, worker) = server((0..4).map(|_| Response::Reset).collect());
+        let result = call_api(&ureq::agent(), &url, "test-key", &json!({}));
+        assert_eq!(worker.join().unwrap().len(), 4);
+        assert!(retryable(
+            result.unwrap_err().downcast_ref::<ureq::Error>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_auth_or_invalid_json() {
+        for (status, body) in [("401 Unauthorized", "{}"), ("200 OK", "not json")] {
+            let (url, worker) = server(vec![Response::Http(status, body)]);
+            let result = call_api(&ureq::agent(), &url, "test-key", &json!({}));
+            assert_eq!(worker.join().unwrap().len(), 1);
+            assert!(!retryable(
+                result.unwrap_err().downcast_ref::<ureq::Error>().unwrap()
+            ));
         }
     }
 }
