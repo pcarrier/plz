@@ -28,6 +28,8 @@
             ];
           };
           cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = [ nixpkgs.legacyPackages.${system}.pkg-config ];
+          buildInputs = [ nixpkgs.legacyPackages.${system}.sqlite ];
           meta.mainProgram = "plz";
         };
       });
